@@ -1,6 +1,7 @@
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 from st_aggrid import AgGrid, DataReturnMode, GridUpdateMode, JsCode
 
@@ -13,10 +14,18 @@ db.init_db()
 
 BOOL_TOGGLE_FIELDS = {"urgent", "paperwork"}
 STAGE_DONE_MAP = {"Make": "make_done", "Press": "press_done", "CNC": "cnc_done"}
+STAGE_LABELS = {"make": "Make", "press": "Press", "cnc": "CNC"}
+
+
+def _get_holiday_dates():
+    return {date.fromisoformat(h["date"]) for h in db.get_holidays()}
+
 
 st.title("Joinery Production Tracker")
 
-tab_dash, tab_upload, tab_holidays = st.tabs(["Dashboard", "Upload SOs", "Public Holidays"])
+tab_dash, tab_schedule, tab_upload, tab_holidays = st.tabs(
+    ["Dashboard", "Schedule", "Upload SOs", "Public Holidays"]
+)
 
 # ---------------------------------------------------------------- Upload tab
 with tab_upload:
@@ -31,6 +40,7 @@ with tab_upload:
     )
     files = st.file_uploader("SO PDFs", type="pdf", accept_multiple_files=True, label_visibility="collapsed")
     if files:
+        holiday_dates = _get_holiday_dates()
         results = []
         for f in files:
             try:
@@ -39,6 +49,10 @@ with tab_upload:
                 results.append((f.name, None, "error", str(e)))
                 continue
             for fields in records:
+                stage = workdays.compute_stage_dates(fields["shipping_date"], holiday_dates)
+                fields["make_date"] = stage["make"].isoformat() if stage["make"] else None
+                fields["press_date"] = stage["press"].isoformat() if stage["press"] else None
+                fields["cnc_date"] = stage["cnc"].isoformat() if stage["cnc"] else None
                 _, action = db.upsert_so(fields)
                 results.append((f.name, fields["so"], action, None))
         for fname, so, action, err in results:
@@ -46,6 +60,126 @@ with tab_upload:
                 st.error(f"**{fname}**: {err}")
             else:
                 st.success(f"**{fname}** → {so} ({action})")
+
+# ------------------------------------------------------------ Schedule tab
+with tab_schedule:
+    st.subheader("Production Schedule")
+
+    stage_label = st.radio("Stage", ["Make", "Press", "CNC"], horizontal=True, key="schedule_stage")
+    stage_key = stage_label.lower()
+    date_col = f"{stage_key}_date"
+
+    holiday_dates = _get_holiday_dates()
+    capacities = db.get_capacities()
+
+    col_cap, col_start, col_days = st.columns([1, 1, 1])
+    with col_cap:
+        new_capacity = st.number_input(
+            f"{stage_label} daily capacity",
+            min_value=1,
+            value=capacities[stage_key],
+            key=f"cap_input_{stage_key}",
+        )
+        if int(new_capacity) != capacities[stage_key]:
+            db.set_capacity(stage_key, int(new_capacity))
+            st.rerun()
+    with col_start:
+        range_start = st.date_input(
+            "Show from", value=date.today() - timedelta(days=3), key=f"sched_start_{stage_key}"
+        )
+    with col_days:
+        num_days = st.slider("Days to show", min_value=7, max_value=60, value=21, key=f"sched_days_{stage_key}")
+
+    range_end = range_start + timedelta(days=num_days)
+    capacity = capacities[stage_key]
+
+    orders = db.get_all_orders()
+    scheduled = [o for o in orders if o[date_col]]
+
+    day_jobs = {}
+    for o in scheduled:
+        d = date.fromisoformat(o[date_col])
+        if range_start <= d < range_end:
+            day_jobs.setdefault(d, []).append(o)
+
+    palette = [
+        "#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f",
+        "#edc948", "#b07aa1", "#ff9da7", "#9c755f", "#bab0ac",
+    ]
+    company_colors = {}
+
+    def _color_for(company):
+        if company not in company_colors:
+            company_colors[company] = palette[len(company_colors) % len(palette)]
+        return company_colors[company]
+
+    fig = go.Figure()
+    day_ms = 24 * 60 * 60 * 1000
+    for d in sorted(day_jobs):
+        for o in day_jobs[d]:
+            fig.add_trace(
+                go.Bar(
+                    x=[d],
+                    y=[o["qty"] or 0],
+                    width=day_ms * 0.8,
+                    name=f"{o['so']} / {o['pro']}",
+                    marker_color=_color_for(o["company"]),
+                    text=o["pro"],
+                    textposition="inside",
+                    insidetextanchor="middle",
+                    hovertemplate=(
+                        f"<b>{o['so']} / {o['pro']}</b><br>"
+                        f"{o['company']}<br>Qty: {o['qty']}<br>Date: {d.isoformat()}<extra></extra>"
+                    ),
+                    showlegend=False,
+                )
+            )
+
+    fig.add_hline(
+        y=capacity,
+        line_dash="dot",
+        line_color="#cc0000",
+        annotation_text=f"Capacity: {capacity}/day",
+        annotation_position="top left",
+    )
+    fig.update_layout(
+        barmode="stack",
+        xaxis=dict(type="date", range=[range_start.isoformat(), range_end.isoformat()], title="Day"),
+        yaxis=dict(title=f"{stage_label} qty scheduled"),
+        height=450,
+        margin=dict(t=30, b=10),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("#### Reschedule a job")
+    if not scheduled:
+        st.info("No scheduled jobs yet.")
+    else:
+        job_options = {
+            f"{o['so']} / {o['pro']} — {o['company']} (Qty {o['qty']}) — currently {o[date_col]}": o
+            for o in sorted(scheduled, key=lambda o: o[date_col])
+        }
+        selected_label = st.selectbox("Job", list(job_options.keys()), key=f"resched_select_{stage_key}")
+        selected_order = job_options[selected_label]
+        current_date = date.fromisoformat(selected_order[date_col])
+
+        col_earlier, col_pick, col_set, col_later = st.columns([1, 1.4, 1, 1])
+        with col_earlier:
+            if st.button("◀ Move earlier", key=f"earlier_{stage_key}"):
+                new_date = workdays.workday(current_date, -1, holiday_dates)
+                db.reschedule_stage(selected_order["id"], stage_key, new_date.isoformat())
+                st.rerun()
+        with col_pick:
+            picked_date = st.date_input("Move to date", value=current_date, key=f"pick_date_{stage_key}")
+        with col_set:
+            if st.button("Set date", key=f"set_date_{stage_key}"):
+                db.reschedule_stage(selected_order["id"], stage_key, picked_date.isoformat())
+                st.rerun()
+        with col_later:
+            if st.button("Move later ▶", key=f"later_{stage_key}"):
+                new_date = workdays.workday(current_date, 1, holiday_dates)
+                db.reschedule_stage(selected_order["id"], stage_key, new_date.isoformat())
+                st.rerun()
 
 # ------------------------------------------------------------- Holidays tab
 with tab_holidays:
@@ -78,14 +212,13 @@ with tab_holidays:
 # ------------------------------------------------------------- Dashboard tab
 with tab_dash:
     orders = db.get_all_orders()
-    holiday_dates = {date.fromisoformat(h["date"]) for h in db.get_holidays()}
 
     if not orders:
         st.info("No sales orders yet. Upload some PDFs in the 'Upload SOs' tab to get started.")
     else:
         rows = []
         for o in orders:
-            stage = workdays.compute_stage_dates(o["shipping_date"], holiday_dates)
+            week_due = workdays.iso_week(o["shipping_date"])
             rows.append(
                 {
                     "id": o["id"],
@@ -95,13 +228,13 @@ with tab_dash:
                     "Qty": o["qty"],
                     "Type": o["type"],
                     "Shipping Date": o["shipping_date"],
-                    "Week Due": stage["week_due"],
+                    "Week Due": week_due,
                     "Urgent": bool(o["urgent"]),
                     "Paperwork": bool(o["paperwork"]),
                     "Movement": o["movement"] or "",
-                    "Make": stage["make"].isoformat() if stage["make"] else "",
-                    "Press": stage["press"].isoformat() if stage["press"] else "",
-                    "CNC": stage["cnc"].isoformat() if stage["cnc"] else "",
+                    "Make": o["make_date"] or "",
+                    "Press": o["press_date"] or "",
+                    "CNC": o["cnc_date"] or "",
                     "make_done": bool(o["make_done"]),
                     "press_done": bool(o["press_done"]),
                     "cnc_done": bool(o["cnc_done"]),
@@ -237,9 +370,10 @@ with tab_dash:
         }
 
         st.caption(
-            "Click a Make / Press / CNC date, or the Urgent / Paperwork boxes, to toggle them. "
+            "Click a Make / Press / CNC date, or the Urgent / Paperwork boxes, to toggle them done. "
             "Movement, Posted, Start Date and Comments are editable text — double-click to edit. "
-            "Tick the checkboxes on the left to select rows to delete."
+            "Tick the checkboxes on the left to select rows to delete. "
+            "To move a job to a different day, use the Schedule tab."
         )
 
         grid_key_version = st.session_state.setdefault("grid_key_version", 0)

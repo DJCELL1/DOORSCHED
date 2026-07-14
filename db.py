@@ -67,6 +67,9 @@ def get_conn():
         conn.close()
 
 
+DEFAULT_CAPACITIES = {"make_capacity": "24", "press_capacity": "24", "cnc_capacity": "24"}
+
+
 def init_db():
     with get_conn() as conn:
         conn.execute("""
@@ -84,6 +87,9 @@ def init_db():
                 posted TEXT DEFAULT '',
                 start_date TEXT DEFAULT '',
                 comments TEXT DEFAULT '',
+                make_date TEXT,
+                press_date TEXT,
+                cnc_date TEXT,
                 make_done INTEGER DEFAULT 0,
                 press_done INTEGER DEFAULT 0,
                 cnc_done INTEGER DEFAULT 0,
@@ -97,13 +103,24 @@ def init_db():
                 name TEXT
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
         existing = conn.execute("SELECT COUNT(*) c FROM public_holidays").fetchone()["c"]
         if existing == 0:
             conn.executemany(
                 "INSERT OR IGNORE INTO public_holidays (date, name) VALUES (?, ?)",
                 SEED_HOLIDAYS,
             )
+        conn.executemany(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+            list(DEFAULT_CAPACITIES.items()),
+        )
         _migrate_unique_key_to_pro(conn)
+        _migrate_add_stage_date_columns(conn)
 
 
 def _migrate_unique_key_to_pro(conn):
@@ -132,6 +149,9 @@ def _migrate_unique_key_to_pro(conn):
             posted TEXT DEFAULT '',
             start_date TEXT DEFAULT '',
             comments TEXT DEFAULT '',
+            make_date TEXT,
+            press_date TEXT,
+            cnc_date TEXT,
             make_done INTEGER DEFAULT 0,
             press_done INTEGER DEFAULT 0,
             cnc_done INTEGER DEFAULT 0,
@@ -139,17 +159,54 @@ def _migrate_unique_key_to_pro(conn):
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    conn.execute("""
+    old_columns = {row["name"] for row in conn.execute("PRAGMA table_info(so_orders_old)").fetchall()}
+    has_stage_cols = {"make_date", "press_date", "cnc_date"} <= old_columns
+    stage_cols_select = "make_date, press_date, cnc_date" if has_stage_cols else "NULL, NULL, NULL"
+    conn.execute(f"""
         INSERT OR IGNORE INTO so_orders
             (so, pro, company, qty, type, shipping_date, urgent, paperwork,
-             movement, posted, start_date, comments, make_done, press_done,
-             cnc_done, created_at, updated_at)
+             movement, posted, start_date, comments, make_date, press_date, cnc_date,
+             make_done, press_done, cnc_done, created_at, updated_at)
         SELECT so, pro, company, qty, type, shipping_date, urgent, paperwork,
-               movement, posted, start_date, comments, make_done, press_done,
-               cnc_done, created_at, updated_at
+               movement, posted, start_date, comments, {stage_cols_select},
+               make_done, press_done, cnc_done, created_at, updated_at
         FROM so_orders_old
     """)
     conn.execute("DROP TABLE so_orders_old")
+
+
+def _migrate_add_stage_date_columns(conn):
+    """Adds make_date/press_date/cnc_date to databases created before stage
+    scheduling was stored, and backfills them from the existing formula so
+    already-tracked orders land on today's default schedule."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(so_orders)").fetchall()}
+    if "make_date" in columns:
+        return
+    conn.execute("ALTER TABLE so_orders ADD COLUMN make_date TEXT")
+    conn.execute("ALTER TABLE so_orders ADD COLUMN press_date TEXT")
+    conn.execute("ALTER TABLE so_orders ADD COLUMN cnc_date TEXT")
+
+    import workdays as _workdays
+    from datetime import date as _date
+
+    holiday_dates = {
+        _date.fromisoformat(r["date"])
+        for r in conn.execute("SELECT date FROM public_holidays").fetchall()
+    }
+    rows = conn.execute("SELECT id, shipping_date FROM so_orders").fetchall()
+    for row in rows:
+        if not row["shipping_date"]:
+            continue
+        stage = _workdays.compute_stage_dates(row["shipping_date"], holiday_dates)
+        conn.execute(
+            "UPDATE so_orders SET make_date=?, press_date=?, cnc_date=? WHERE id=?",
+            (
+                stage["make"].isoformat() if stage["make"] else None,
+                stage["press"].isoformat() if stage["press"] else None,
+                stage["cnc"].isoformat() if stage["cnc"] else None,
+                row["id"],
+            ),
+        )
 
 
 def get_holidays():
@@ -175,29 +232,52 @@ def upsert_so(record: dict):
     """Insert a new row per PRO, or update only the PDF-derived fields if that
     PRO already exists (manual fields like Urgent/Movement/Comments/done-flags
     are left untouched). PRO is the unique key: one sales order (SO) can
-    contain several PROs, each tracked as its own row."""
+    contain several PROs, each tracked as its own row.
+
+    `record` must include computed default make_date/press_date/cnc_date.
+    Those defaults are only written on first insert, or if the Shipping Date
+    changes on a re-upload -- otherwise a job's schedule stays wherever it was
+    manually moved to on the Schedule tab."""
     with get_conn() as conn:
         existing = conn.execute(
-            "SELECT id FROM so_orders WHERE pro = ?", (record["pro"],)
+            "SELECT id, shipping_date FROM so_orders WHERE pro = ?", (record["pro"],)
         ).fetchone()
         if existing:
-            conn.execute(
-                """UPDATE so_orders SET so=?, company=?, qty=?, type=?,
-                   shipping_date=?, updated_at=CURRENT_TIMESTAMP WHERE pro=?""",
-                (
-                    record.get("so"),
-                    record.get("company"),
-                    record.get("qty"),
-                    record.get("type"),
-                    record.get("shipping_date"),
-                    record["pro"],
-                ),
-            )
+            if existing["shipping_date"] != record.get("shipping_date"):
+                conn.execute(
+                    """UPDATE so_orders SET so=?, company=?, qty=?, type=?, shipping_date=?,
+                       make_date=?, press_date=?, cnc_date=?, updated_at=CURRENT_TIMESTAMP WHERE pro=?""",
+                    (
+                        record.get("so"),
+                        record.get("company"),
+                        record.get("qty"),
+                        record.get("type"),
+                        record.get("shipping_date"),
+                        record.get("make_date"),
+                        record.get("press_date"),
+                        record.get("cnc_date"),
+                        record["pro"],
+                    ),
+                )
+            else:
+                conn.execute(
+                    """UPDATE so_orders SET so=?, company=?, qty=?, type=?,
+                       shipping_date=?, updated_at=CURRENT_TIMESTAMP WHERE pro=?""",
+                    (
+                        record.get("so"),
+                        record.get("company"),
+                        record.get("qty"),
+                        record.get("type"),
+                        record.get("shipping_date"),
+                        record["pro"],
+                    ),
+                )
             return existing["id"], "updated"
         else:
             cur = conn.execute(
-                """INSERT INTO so_orders (so, pro, company, qty, type, shipping_date)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO so_orders (so, pro, company, qty, type, shipping_date,
+                   make_date, press_date, cnc_date)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     record.get("so"),
                     record["pro"],
@@ -205,9 +285,50 @@ def upsert_so(record: dict):
                     record.get("qty"),
                     record.get("type"),
                     record.get("shipping_date"),
+                    record.get("make_date"),
+                    record.get("press_date"),
+                    record.get("cnc_date"),
                 ),
             )
             return cur.lastrowid, "inserted"
+
+
+STAGE_DATE_COLUMNS = {"make": "make_date", "press": "press_date", "cnc": "cnc_date"}
+
+
+def reschedule_stage(order_id: int, stage: str, new_date: str):
+    """Manually move a job's Make/Press/CNC date (used by the Schedule tab)."""
+    if stage not in STAGE_DATE_COLUMNS:
+        raise ValueError(f"Unknown stage: {stage}")
+    column = STAGE_DATE_COLUMNS[stage]
+    with get_conn() as conn:
+        conn.execute(
+            f"UPDATE so_orders SET {column} = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (new_date, order_id),
+        )
+
+
+def get_capacities() -> dict:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT key, value FROM settings WHERE key IN ('make_capacity', 'press_capacity', 'cnc_capacity')"
+        ).fetchall()
+        values = {r["key"]: int(r["value"]) for r in rows}
+    return {
+        "make": values.get("make_capacity", 24),
+        "press": values.get("press_capacity", 24),
+        "cnc": values.get("cnc_capacity", 24),
+    }
+
+
+def set_capacity(stage: str, value: int):
+    if stage not in STAGE_DATE_COLUMNS:
+        raise ValueError(f"Unknown stage: {stage}")
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            (f"{stage}_capacity", str(value)),
+        )
 
 
 def get_all_orders():
