@@ -35,10 +35,26 @@ def _parse_date(date_str: str) -> str:
     raise PdfExtractionError(f"Unrecognised date format: {date_str}")
 
 
-def extract_fields(pdf_bytes_or_path) -> dict:
-    with pdfplumber.open(pdf_bytes_or_path) as pdf:
-        text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+def _group_pages_into_orders(page_texts: list) -> list:
+    """A single printout can contain several orders stacked back to back (each
+    order starts fresh on its own 'Page 1 of N'). A page belongs to a NEW order
+    only if it has its own 'Order No.' block; plain continuation pages (extra
+    component listings) don't repeat that block and stay attached to the
+    order they follow."""
+    blocks = []
+    current = []
+    for text in page_texts:
+        if SO_RE.search(text) and current:
+            blocks.append(current)
+            current = [text]
+        else:
+            current.append(text)
+    if current:
+        blocks.append(current)
+    return blocks
 
+
+def _extract_from_text(text: str) -> dict:
     so_match = SO_RE.search(text)
     pro_match = PRO_RE.search(text)
     company_match = COMPANY_RE.search(text)
@@ -58,7 +74,7 @@ def extract_fields(pdf_bytes_or_path) -> dict:
     ]
     if missing:
         raise PdfExtractionError(
-            "Could not find the following field(s) in the PDF: " + ", ".join(missing)
+            "Could not find the following field(s): " + ", ".join(missing)
         )
 
     return {
@@ -69,3 +85,30 @@ def extract_fields(pdf_bytes_or_path) -> dict:
         "type": _parse_type(text),
         "shipping_date": _parse_date(due_match.group(1)),
     }
+
+
+def extract_all_records(pdf_bytes_or_path) -> list:
+    """Parses one PDF that may hold one or several sales orders (combined
+    printouts) into a list of order dicts, one per order."""
+    with pdfplumber.open(pdf_bytes_or_path) as pdf:
+        page_texts = [page.extract_text() or "" for page in pdf.pages]
+
+    blocks = _group_pages_into_orders(page_texts)
+
+    records = []
+    errors = []
+    for block in blocks:
+        combined = "\n".join(block)
+        try:
+            records.append(_extract_from_text(combined))
+        except PdfExtractionError as e:
+            errors.append(str(e))
+
+    if not records:
+        raise PdfExtractionError("; ".join(errors) or "No sales orders found in PDF")
+    return records
+
+
+def extract_fields(pdf_bytes_or_path) -> dict:
+    """Back-compat single-order helper: returns the first order found."""
+    return extract_all_records(pdf_bytes_or_path)[0]

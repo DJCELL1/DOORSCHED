@@ -22,20 +22,24 @@ tab_dash, tab_upload, tab_holidays = st.tabs(["Dashboard", "Upload SOs", "Public
 with tab_upload:
     st.subheader("Bulk upload Sales Order PDFs")
     st.caption(
-        "Drop in as many SO PDFs as you like. Re-uploading a PDF for an SO already "
-        "in the tracker updates its extracted fields (Company/Qty/Type/Shipping Date) "
-        "without touching anything you've entered by hand (Urgent, Movement, Comments, etc.)."
+        "Drop in as many SO PDFs as you like — a single PDF can hold one order or "
+        "several combined together, each is picked out and tracked separately. "
+        "Re-uploading a PDF for an SO already in the tracker updates its extracted "
+        "fields (Company/Qty/Type/Shipping Date) without touching anything you've "
+        "entered by hand (Urgent, Movement, Comments, etc.)."
     )
     files = st.file_uploader("SO PDFs", type="pdf", accept_multiple_files=True, label_visibility="collapsed")
     if files:
         results = []
         for f in files:
             try:
-                fields = pdf_parser.extract_fields(f)
-                _, action = db.upsert_so(fields)
-                results.append((f.name, fields["so"], action, None))
+                records = pdf_parser.extract_all_records(f)
             except pdf_parser.PdfExtractionError as e:
                 results.append((f.name, None, "error", str(e)))
+                continue
+            for fields in records:
+                _, action = db.upsert_so(fields)
+                results.append((f.name, fields["so"], action, None))
         for fname, so, action, err in results:
             if err:
                 st.error(f"**{fname}**: {err}")
