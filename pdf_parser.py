@@ -36,41 +36,52 @@ def _parse_date(date_str: str) -> str:
 
 
 def _group_pages_into_orders(page_texts: list) -> list:
-    """A single printout can contain several orders stacked back to back (each
-    order starts fresh on its own 'Page 1 of N'). A page belongs to a NEW order
-    only if it has its own 'Order No.' block; plain continuation pages (extra
-    component listings) don't repeat that block and stay attached to the
-    order they follow."""
+    """A single printout can contain several orders/PROs stacked back to back.
+    A page starts a NEW block if it introduces its own 'Order No.' section, or
+    if it shows a different PRO number than the block currently being built
+    (some combined printouts repeat the PRO/Due Date/Quantity per component
+    without re-printing the SO-level 'Order No.' header). Plain continuation
+    pages (extra component listings that repeat the same PRO) stay attached to
+    the block they follow."""
     blocks = []
     current = []
+    current_pro = None
     for text in page_texts:
-        if SO_RE.search(text) and current:
+        pro_match = PRO_RE.search(text)
+        page_pro = pro_match.group(0) if pro_match else None
+        starts_new_order = bool(SO_RE.search(text))
+        starts_new_pro = page_pro is not None and current_pro is not None and page_pro != current_pro
+        if current and (starts_new_order or starts_new_pro):
             blocks.append(current)
-            current = [text]
-        else:
-            current.append(text)
+            current = []
+        current.append(text)
+        if page_pro:
+            current_pro = page_pro
     if current:
         blocks.append(current)
     return blocks
 
 
-def _extract_from_text(text: str) -> dict:
+def _extract_from_text(text: str, fallback_so=None, fallback_company=None) -> dict:
     so_match = SO_RE.search(text)
     pro_match = PRO_RE.search(text)
     company_match = COMPANY_RE.search(text)
     qty_match = QTY_RE.search(text)
     due_match = DUE_DATE_RE.search(text)
 
+    so_value = so_match.group(1) if so_match else fallback_so
+    company_value = company_match.group(1).strip() if company_match else fallback_company
+
     missing = [
         name
-        for name, m in (
-            ("Order No. (SO)", so_match),
+        for name, val in (
+            ("Order No. (SO)", so_value),
             ("PRO number", pro_match),
-            ("Source Name (Company)", company_match),
+            ("Source Name (Company)", company_value),
             ("Quantity", qty_match),
             ("Due Date", due_match),
         )
-        if not m
+        if not val
     ]
     if missing:
         raise PdfExtractionError(
@@ -78,9 +89,9 @@ def _extract_from_text(text: str) -> dict:
         )
 
     return {
-        "so": so_match.group(1),
+        "so": so_value,
         "pro": pro_match.group(0),
-        "company": company_match.group(1).strip(),
+        "company": company_value,
         "qty": int(qty_match.group(1)),
         "type": _parse_type(text),
         "shipping_date": _parse_date(due_match.group(1)),
@@ -88,8 +99,8 @@ def _extract_from_text(text: str) -> dict:
 
 
 def extract_all_records(pdf_bytes_or_path) -> list:
-    """Parses one PDF that may hold one or several sales orders (combined
-    printouts) into a list of order dicts, one per order."""
+    """Parses one PDF that may hold one or several sales orders/PROs (combined
+    printouts) into a list of order dicts, one per order/PRO."""
     with pdfplumber.open(pdf_bytes_or_path) as pdf:
         page_texts = [page.extract_text() or "" for page in pdf.pages]
 
@@ -97,12 +108,18 @@ def extract_all_records(pdf_bytes_or_path) -> list:
 
     records = []
     errors = []
+    last_so = None
+    last_company = None
     for block in blocks:
         combined = "\n".join(block)
         try:
-            records.append(_extract_from_text(combined))
+            record = _extract_from_text(combined, fallback_so=last_so, fallback_company=last_company)
         except PdfExtractionError as e:
             errors.append(str(e))
+            continue
+        records.append(record)
+        last_so = record["so"]
+        last_company = record["company"]
 
     if not records:
         raise PdfExtractionError("; ".join(errors) or "No sales orders found in PDF")

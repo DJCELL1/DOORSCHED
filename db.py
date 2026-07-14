@@ -72,8 +72,8 @@ def init_db():
         conn.execute("""
             CREATE TABLE IF NOT EXISTS so_orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                so TEXT UNIQUE NOT NULL,
-                pro TEXT,
+                so TEXT NOT NULL,
+                pro TEXT UNIQUE,
                 company TEXT,
                 qty INTEGER,
                 type TEXT,
@@ -103,6 +103,53 @@ def init_db():
                 "INSERT OR IGNORE INTO public_holidays (date, name) VALUES (?, ?)",
                 SEED_HOLIDAYS,
             )
+        _migrate_unique_key_to_pro(conn)
+
+
+def _migrate_unique_key_to_pro(conn):
+    """One-off migration: earlier versions treated SO as the unique key (one
+    row per sales order). Since a sales order can carry several PROs, PRO is
+    now the unique key (one row per production item). Rebuilds the table in
+    place if it still has the old constraint; existing rows are preserved."""
+    table_sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='so_orders'"
+    ).fetchone()["sql"]
+    if "pro TEXT UNIQUE" in table_sql:
+        return  # already migrated
+    conn.execute("ALTER TABLE so_orders RENAME TO so_orders_old")
+    conn.execute("""
+        CREATE TABLE so_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            so TEXT NOT NULL,
+            pro TEXT UNIQUE,
+            company TEXT,
+            qty INTEGER,
+            type TEXT,
+            shipping_date TEXT,
+            urgent INTEGER DEFAULT 0,
+            paperwork INTEGER DEFAULT 0,
+            movement TEXT DEFAULT '',
+            posted TEXT DEFAULT '',
+            start_date TEXT DEFAULT '',
+            comments TEXT DEFAULT '',
+            make_done INTEGER DEFAULT 0,
+            press_done INTEGER DEFAULT 0,
+            cnc_done INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("""
+        INSERT OR IGNORE INTO so_orders
+            (so, pro, company, qty, type, shipping_date, urgent, paperwork,
+             movement, posted, start_date, comments, make_done, press_done,
+             cnc_done, created_at, updated_at)
+        SELECT so, pro, company, qty, type, shipping_date, urgent, paperwork,
+               movement, posted, start_date, comments, make_done, press_done,
+               cnc_done, created_at, updated_at
+        FROM so_orders_old
+    """)
+    conn.execute("DROP TABLE so_orders_old")
 
 
 def get_holidays():
@@ -125,24 +172,25 @@ def delete_holiday(date_str):
 
 
 def upsert_so(record: dict):
-    """Insert a new SO row, or update only the PDF-derived fields if the SO
-    already exists (manual fields like Urgent/Movement/Comments/done-flags
-    are left untouched)."""
+    """Insert a new row per PRO, or update only the PDF-derived fields if that
+    PRO already exists (manual fields like Urgent/Movement/Comments/done-flags
+    are left untouched). PRO is the unique key: one sales order (SO) can
+    contain several PROs, each tracked as its own row."""
     with get_conn() as conn:
         existing = conn.execute(
-            "SELECT id FROM so_orders WHERE so = ?", (record["so"],)
+            "SELECT id FROM so_orders WHERE pro = ?", (record["pro"],)
         ).fetchone()
         if existing:
             conn.execute(
-                """UPDATE so_orders SET pro=?, company=?, qty=?, type=?,
-                   shipping_date=?, updated_at=CURRENT_TIMESTAMP WHERE so=?""",
+                """UPDATE so_orders SET so=?, company=?, qty=?, type=?,
+                   shipping_date=?, updated_at=CURRENT_TIMESTAMP WHERE pro=?""",
                 (
-                    record.get("pro"),
+                    record.get("so"),
                     record.get("company"),
                     record.get("qty"),
                     record.get("type"),
                     record.get("shipping_date"),
-                    record["so"],
+                    record["pro"],
                 ),
             )
             return existing["id"], "updated"
@@ -151,8 +199,8 @@ def upsert_so(record: dict):
                 """INSERT INTO so_orders (so, pro, company, qty, type, shipping_date)
                    VALUES (?, ?, ?, ?, ?, ?)""",
                 (
-                    record["so"],
-                    record.get("pro"),
+                    record.get("so"),
+                    record["pro"],
                     record.get("company"),
                     record.get("qty"),
                     record.get("type"),

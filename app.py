@@ -23,10 +23,11 @@ with tab_upload:
     st.subheader("Bulk upload Sales Order PDFs")
     st.caption(
         "Drop in as many SO PDFs as you like — a single PDF can hold one order or "
-        "several combined together, each is picked out and tracked separately. "
-        "Re-uploading a PDF for an SO already in the tracker updates its extracted "
-        "fields (Company/Qty/Type/Shipping Date) without touching anything you've "
-        "entered by hand (Urgent, Movement, Comments, etc.)."
+        "several combined together (even multiple PROs under the same SO), each is "
+        "picked out and tracked as its own row. Re-uploading a PDF for a PRO already "
+        "in the tracker updates its extracted fields (SO/Company/Qty/Type/Shipping "
+        "Date) without touching anything you've entered by hand (Urgent, Movement, "
+        "Comments, etc.)."
     )
     files = st.file_uploader("SO PDFs", type="pdf", accept_multiple_files=True, label_visibility="collapsed")
     if files:
