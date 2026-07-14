@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+so_tracker.db
+.streamlit/
+.claude/
