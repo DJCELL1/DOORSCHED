@@ -227,25 +227,44 @@ with tab_dash:
             "getRowStyle": get_row_style,
             "rowHeight": 32,
             "headerHeight": 34,
-            "suppressRowClickSelection": True,
+            "rowSelection": {
+                "mode": "multiRow",
+                "checkboxes": True,
+                "headerCheckbox": True,
+                "enableClickSelection": False,
+            },
         }
 
         st.caption(
             "Click a Make / Press / CNC date, or the Urgent / Paperwork boxes, to toggle them. "
-            "Movement, Posted, Start Date and Comments are editable text — double-click to edit."
+            "Movement, Posted, Start Date and Comments are editable text — double-click to edit. "
+            "Tick the checkboxes on the left to select rows to delete."
         )
+
+        grid_key_version = st.session_state.setdefault("grid_key_version", 0)
 
         grid_response = AgGrid(
             df,
             gridOptions=grid_options,
-            update_mode=GridUpdateMode.VALUE_CHANGED,
+            update_mode=GridUpdateMode.VALUE_CHANGED | GridUpdateMode.SELECTION_CHANGED,
             data_return_mode=DataReturnMode.AS_INPUT,
             allow_unsafe_jscode=True,
             fit_columns_on_grid_load=False,
             height=min(80 + 32 * (len(df) + 1), 700),
             theme="balham",
-            key="dashboard_grid",
+            key=f"dashboard_grid_{grid_key_version}",
         )
+
+        selected_df = grid_response.selected_rows
+        if selected_df is not None and len(selected_df) > 0:
+            selected_ids = [int(i) for i in selected_df["id"].tolist()]
+            selected_sos = selected_df["SO"].tolist()
+            st.warning(f"Selected {len(selected_ids)} row(s): {', '.join(selected_sos)}")
+            if st.button(f"Delete {len(selected_ids)} selected row(s)", type="primary"):
+                for so_id in selected_ids:
+                    db.delete_order(so_id)
+                st.session_state["grid_key_version"] += 1
+                st.rerun()
 
         updated_df = pd.DataFrame(grid_response["data"])
         editable_fields = {
