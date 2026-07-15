@@ -7,9 +7,11 @@ import db
 import helpers
 import workdays
 
+holiday_dates = helpers.get_holiday_dates()
+
 _q = st.query_params
 if {"resched_id", "resched_stage", "resched_date"} <= set(_q.keys()):
-    db.reschedule_stage(int(_q["resched_id"]), _q["resched_stage"], _q["resched_date"])
+    db.reschedule_stage(int(_q["resched_id"]), _q["resched_stage"], _q["resched_date"], holiday_dates)
     st.query_params.clear()
     st.rerun()
 
@@ -19,7 +21,6 @@ stage_label = st.radio("Stage", ["Make", "Press", "CNC"], horizontal=True, key="
 stage_key = stage_label.lower()
 date_col = f"{stage_key}_date"
 
-holiday_dates = helpers.get_holiday_dates()
 capacities = db.get_capacities()
 
 col_cap, col_start, col_days = st.columns([1, 1, 1])
@@ -52,7 +53,11 @@ for o in scheduled:
     if range_start <= d < range_end:
         day_jobs.setdefault(d, []).append(o)
 
-st.caption("Drag a job's box onto another day to reschedule it — box height is its door quantity.")
+st.caption(
+    "Drag a job's box onto another day to reschedule it — box height is its door quantity. "
+    "Moving a Make date also carries Press to the same day and CNC to the next working day; "
+    "moving Press or CNC on their own only moves that stage."
+)
 
 PX_PER_UNIT = 4
 MIN_CARD_H = 30
@@ -198,16 +203,16 @@ else:
     with col_earlier:
         if st.button("◀ Move earlier", key=f"earlier_{stage_key}"):
             new_date = workdays.workday(current_date, -1, holiday_dates)
-            db.reschedule_stage(selected_order["id"], stage_key, new_date.isoformat())
+            db.reschedule_stage(selected_order["id"], stage_key, new_date.isoformat(), holiday_dates)
             st.rerun()
     with col_pick:
         picked_date = st.date_input("Move to date", value=current_date, key=f"pick_date_{stage_key}")
     with col_set:
         if st.button("Set date", key=f"set_date_{stage_key}"):
-            db.reschedule_stage(selected_order["id"], stage_key, picked_date.isoformat())
+            db.reschedule_stage(selected_order["id"], stage_key, picked_date.isoformat(), holiday_dates)
             st.rerun()
     with col_later:
         if st.button("Move later ▶", key=f"later_{stage_key}"):
             new_date = workdays.workday(current_date, 1, holiday_dates)
-            db.reschedule_stage(selected_order["id"], stage_key, new_date.isoformat())
+            db.reschedule_stage(selected_order["id"], stage_key, new_date.isoformat(), holiday_dates)
             st.rerun()

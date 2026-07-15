@@ -11,6 +11,7 @@ pages = [
     st.Page("views/dashboard.py", title="Dashboard", icon="📊", default=True),
     st.Page("views/scan.py", title="Scan", icon="📷"),
     st.Page("views/schedule.py", title="Schedule", icon="📅"),
+    st.Page("views/run_sheet.py", title="Daily Run Sheet", icon="📋"),
     st.Page("views/upload.py", title="Upload SOs", icon="📤"),
     st.Page("views/holidays.py", title="Public Holidays", icon="🗓️"),
 ]

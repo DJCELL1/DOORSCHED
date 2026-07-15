@@ -1,5 +1,8 @@
 import sqlite3
 from contextlib import contextmanager
+from datetime import date
+
+import workdays
 
 DB_PATH = "so_tracker.db"
 
@@ -201,18 +204,15 @@ def _migrate_add_stage_date_columns(conn):
     conn.execute("ALTER TABLE so_orders ADD COLUMN press_date TEXT")
     conn.execute("ALTER TABLE so_orders ADD COLUMN cnc_date TEXT")
 
-    import workdays as _workdays
-    from datetime import date as _date
-
     holiday_dates = {
-        _date.fromisoformat(r["date"])
+        date.fromisoformat(r["date"])
         for r in conn.execute("SELECT date FROM public_holidays").fetchall()
     }
     rows = conn.execute("SELECT id, shipping_date FROM so_orders").fetchall()
     for row in rows:
         if not row["shipping_date"]:
             continue
-        stage = _workdays.compute_stage_dates(row["shipping_date"], holiday_dates)
+        stage = workdays.compute_stage_dates(row["shipping_date"], holiday_dates)
         conn.execute(
             "UPDATE so_orders SET make_date=?, press_date=?, cnc_date=? WHERE id=?",
             (
@@ -327,8 +327,14 @@ def upsert_so(record: dict):
 STAGE_DATE_COLUMNS = {"make": "make_date", "press": "press_date", "cnc": "cnc_date"}
 
 
-def reschedule_stage(order_id: int, stage: str, new_date: str):
-    """Manually move a job's Make/Press/CNC date (used by the Schedule tab)."""
+def reschedule_stage(order_id: int, stage: str, new_date: str, holidays: set = None):
+    """Manually move a job's Make/Press/CNC date (used by the Schedule tab).
+
+    Make and Press are done by the same person on the same day, with CNC the
+    next working day after. So moving Make also carries Press to the same
+    date and CNC to the next working day. Moving Press or CNC on their own
+    only moves that one stage -- the CNC person, say, can shift their day
+    without disturbing Make/Press."""
     if stage not in STAGE_DATE_COLUMNS:
         raise ValueError(f"Unknown stage: {stage}")
     column = STAGE_DATE_COLUMNS[stage]
@@ -337,6 +343,12 @@ def reschedule_stage(order_id: int, stage: str, new_date: str):
             f"UPDATE so_orders SET {column} = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             (new_date, order_id),
         )
+        if stage == "make":
+            cnc_date = workdays.workday(date.fromisoformat(new_date), 1, holidays or set())
+            conn.execute(
+                "UPDATE so_orders SET press_date = ?, cnc_date = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (new_date, cnc_date.isoformat(), order_id),
+            )
 
 
 def get_capacities() -> dict:
