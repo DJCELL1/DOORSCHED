@@ -2,4 +2,3 @@ streamlit
 pdfplumber
 pandas
 streamlit-aggrid
-plotly

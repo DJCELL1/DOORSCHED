@@ -52,7 +52,11 @@ PDF_FIELDS = ["pro", "company", "qty", "type", "shipping_date"]
 MANUAL_FIELDS = [
     "urgent", "paperwork", "movement", "posted", "start_date", "comments",
     "make_done", "press_done", "cnc_done",
+    "make_progress", "press_progress", "cnc_progress",
 ]
+
+PROGRESS_COLUMNS = {"make": "make_progress", "press": "press_progress", "cnc": "cnc_progress"}
+DONE_COLUMNS = {"make": "make_done", "press": "press_done", "cnc": "cnc_done"}
 
 
 @contextmanager
@@ -93,6 +97,9 @@ def init_db():
                 make_done INTEGER DEFAULT 0,
                 press_done INTEGER DEFAULT 0,
                 cnc_done INTEGER DEFAULT 0,
+                make_progress INTEGER DEFAULT 0,
+                press_progress INTEGER DEFAULT 0,
+                cnc_progress INTEGER DEFAULT 0,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
@@ -121,6 +128,7 @@ def init_db():
         )
         _migrate_unique_key_to_pro(conn)
         _migrate_add_stage_date_columns(conn)
+        _migrate_add_progress_columns(conn)
 
 
 def _migrate_unique_key_to_pro(conn):
@@ -155,6 +163,9 @@ def _migrate_unique_key_to_pro(conn):
             make_done INTEGER DEFAULT 0,
             press_done INTEGER DEFAULT 0,
             cnc_done INTEGER DEFAULT 0,
+            make_progress INTEGER DEFAULT 0,
+            press_progress INTEGER DEFAULT 0,
+            cnc_progress INTEGER DEFAULT 0,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
@@ -162,14 +173,18 @@ def _migrate_unique_key_to_pro(conn):
     old_columns = {row["name"] for row in conn.execute("PRAGMA table_info(so_orders_old)").fetchall()}
     has_stage_cols = {"make_date", "press_date", "cnc_date"} <= old_columns
     stage_cols_select = "make_date, press_date, cnc_date" if has_stage_cols else "NULL, NULL, NULL"
+    has_progress_cols = {"make_progress", "press_progress", "cnc_progress"} <= old_columns
+    progress_cols_select = "make_progress, press_progress, cnc_progress" if has_progress_cols else "0, 0, 0"
     conn.execute(f"""
         INSERT OR IGNORE INTO so_orders
             (so, pro, company, qty, type, shipping_date, urgent, paperwork,
              movement, posted, start_date, comments, make_date, press_date, cnc_date,
-             make_done, press_done, cnc_done, created_at, updated_at)
+             make_done, press_done, cnc_done, make_progress, press_progress, cnc_progress,
+             created_at, updated_at)
         SELECT so, pro, company, qty, type, shipping_date, urgent, paperwork,
                movement, posted, start_date, comments, {stage_cols_select},
-               make_done, press_done, cnc_done, created_at, updated_at
+               make_done, press_done, cnc_done, {progress_cols_select},
+               created_at, updated_at
         FROM so_orders_old
     """)
     conn.execute("DROP TABLE so_orders_old")
@@ -207,6 +222,22 @@ def _migrate_add_stage_date_columns(conn):
                 row["id"],
             ),
         )
+
+
+def _migrate_add_progress_columns(conn):
+    """Adds make_progress/press_progress/cnc_progress (units completed so
+    far, entered from the mobile Scan tab) to databases created before
+    quantity-based progress tracking existed. Backfills from the old
+    all-or-nothing *_done flags so already-completed jobs show as 100%."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(so_orders)").fetchall()}
+    if "make_progress" in columns:
+        return
+    conn.execute("ALTER TABLE so_orders ADD COLUMN make_progress INTEGER DEFAULT 0")
+    conn.execute("ALTER TABLE so_orders ADD COLUMN press_progress INTEGER DEFAULT 0")
+    conn.execute("ALTER TABLE so_orders ADD COLUMN cnc_progress INTEGER DEFAULT 0")
+    conn.execute("UPDATE so_orders SET make_progress = qty WHERE make_done = 1")
+    conn.execute("UPDATE so_orders SET press_progress = qty WHERE press_done = 1")
+    conn.execute("UPDATE so_orders SET cnc_progress = qty WHERE cnc_done = 1")
 
 
 def get_holidays():
@@ -335,6 +366,33 @@ def get_all_orders():
     with get_conn() as conn:
         rows = conn.execute("SELECT * FROM so_orders ORDER BY shipping_date ASC").fetchall()
         return [dict(r) for r in rows]
+
+
+def get_order_by_pro(pro: str):
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM so_orders WHERE pro = ?", (pro,)).fetchone()
+        return dict(row) if row else None
+
+
+def update_progress(order_id: int, stage: str, qty_done: int):
+    """Sets how many units of a stage are complete (used by the mobile Scan
+    tab). Clamped to [0, qty]; the boolean *_done flag is kept in sync."""
+    if stage not in PROGRESS_COLUMNS:
+        raise ValueError(f"Unknown stage: {stage}")
+    progress_col = PROGRESS_COLUMNS[stage]
+    done_col = DONE_COLUMNS[stage]
+    with get_conn() as conn:
+        row = conn.execute("SELECT qty FROM so_orders WHERE id = ?", (order_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"No order with id {order_id}")
+        total = row["qty"] or 0
+        clamped = max(0, min(int(qty_done), total))
+        done = 1 if total > 0 and clamped >= total else 0
+        conn.execute(
+            f"UPDATE so_orders SET {progress_col} = ?, {done_col} = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (clamped, done, order_id),
+        )
+        return clamped
 
 
 def update_order_field(so_id: int, field: str, value):
