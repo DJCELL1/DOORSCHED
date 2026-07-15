@@ -2,3 +2,4 @@ streamlit
 pdfplumber
 pandas
 streamlit-aggrid
+streamlit-autorefresh

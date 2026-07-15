@@ -1,9 +1,26 @@
 import pandas as pd
 import streamlit as st
 from st_aggrid import AgGrid, DataReturnMode, GridUpdateMode, JsCode
+from streamlit_autorefresh import st_autorefresh
 
 import db
 import workdays
+
+col_refresh, col_interval = st.columns([1, 2])
+with col_refresh:
+    auto_refresh = st.checkbox(
+        "Auto-refresh",
+        value=True,
+        key="dash_auto_refresh",
+        help="Keeps this page in sync with updates made on the Scan and Daily Run Sheet pages, "
+        "even if this browser tab is just sitting open on a wall display.",
+    )
+with col_interval:
+    refresh_seconds = st.number_input(
+        "Every (seconds)", min_value=3, max_value=120, value=8, step=1, key="dash_auto_refresh_secs"
+    )
+if auto_refresh:
+    st_autorefresh(interval=refresh_seconds * 1000, key="dashboard_autorefresh_timer")
 
 orders = db.get_all_orders()
 
